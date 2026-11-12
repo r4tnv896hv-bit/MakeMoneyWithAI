@@ -31,6 +31,7 @@ OPENAI_MODEL = "gpt-5-mini"
 # (needs the "models: read" permission). Used when OPENAI_API_KEY is not set.
 GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
 GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL") or "openai/gpt-4.1-mini"
+MAX_GENERATION_FAILURES = 3  # Consecutive failures before generation is skipped for the run
 GITHUB_MODELS_DELAY = 5  # Seconds between calls; the free tier allows few requests per minute
 
 
@@ -321,9 +322,11 @@ Note:
     try:
         business_model = response.json()['choices'][0]['message']['content'].strip()
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        hops = [f"{r.status_code} {r.url}" for r in getattr(response, "history", [])]
         raise Exception(
             f"Unexpected response from {model} "
-            f"({response.headers.get('Content-Type')}): {response.text[:300]!r}"
+            f"({response.headers.get('Content-Type')}, final URL {getattr(response, 'url', url)}, "
+            f"redirects {hops}): {response.text[:300]!r}"
         )
     if not business_model:
         raise Exception(f"Empty answer from {model}")
@@ -412,6 +415,7 @@ def main(max_repos=None):
     
     print(f"Generating business models with {model_provider()[2]}")
     generation_enabled = True
+    failures_in_a_row = 0
 
     # 1. Read existing repos from CSV file
     print("Reading existing repositories from CSV...")
@@ -489,6 +493,7 @@ def main(max_repos=None):
             if generation_enabled:
                 try:
                     business_model = generate_business_model(repo)
+                    failures_in_a_row = 0
                 except RateLimited as e:
                     # Quota used up: the remaining repos are retried on the next run
                     print(f"Stopping generation for this run at {full_name}: {e}")
@@ -496,6 +501,11 @@ def main(max_repos=None):
                 except Exception as e:
                     # If the call fails for any other reason, fall back gracefully
                     print(f"Failed to generate business model for {full_name}: {e}")
+                    failures_in_a_row += 1
+                    if failures_in_a_row >= MAX_GENERATION_FAILURES:
+                        # The provider is down or misconfigured: do not keep waiting on it
+                        print("Stopping generation for this run after repeated failures")
+                        generation_enabled = False
             repo_data['business_model'] = business_model
 
     print(f"Total unique repos: {len(unique_repos)}")

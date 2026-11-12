@@ -229,6 +229,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual(result[3]["business_model"], "Plain 3")
         self.assertEqual(gen.call_count, 2)  # stopped after the first refusal
 
+    def test_repeated_failures_stop_generation_for_the_run(self):
+        search = [make_repo(i, f"repo{i}", f"Plain {i}", stars=1000 - i) for i in range(1, 8)]
+
+        def fail(repo):
+            raise RuntimeError("provider down")
+
+        result, gen = self.run_main([], search, fail)
+        self.assertEqual(len(result), 7)
+        self.assertEqual(gen.call_count, fp.MAX_GENERATION_FAILURES)
+
 
 class ModelProviderTest(unittest.TestCase):
     REPO = make_repo(1, "tool", "A tool")
