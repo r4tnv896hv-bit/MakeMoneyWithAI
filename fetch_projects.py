@@ -13,8 +13,11 @@ MIN_STARS = 10000
 MAX_REPOS = 100
 OUTPUT_FILE = "README.md"  # Output file name changed to README.md
 EXCLUDE_FILE = "excluded-repos.txt"  # File containing repos to exclude
+EXTRA_FILE = "extra-repos.txt"  # File containing repos that are always included
 CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
+REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
+OPENAI_TIMEOUT = 120
 
 # OpenAI API configuration
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -35,7 +38,7 @@ def fetch_repositories(topic):
             "per_page": PER_PAGE,
             "page": page
         }
-        response = requests.get(GITHUB_API, headers=HEADERS, params=params)
+        response = requests.get(GITHUB_API, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
         repos_curr = response.json().get("items", [])
         if len(repos_curr) == 0:
             break
@@ -85,13 +88,41 @@ def load_excluded():
 def load_extra_repos():
     """Load additional repositories from extra-repos.txt."""
     extra_repos = []
-    with open("extra-repos.txt", "r") as file:
+    if not os.path.exists(EXTRA_FILE):
+        return extra_repos
+
+    with open(EXTRA_FILE, "r") as file:
         for line in file:
             owner_repo = line.strip()
             if owner_repo:
                 owner, repo = owner_repo.split("/")
                 extra_repos.append({"owner": owner, "name": repo})
     return extra_repos
+
+def select_repos(repos_dict):
+    """Apply exclusion rules and return at most MAX_REPOS repos sorted by stars.
+
+    Repositories listed in extra-repos.txt are always kept, even when their star
+    count would not place them in the top MAX_REPOS; the remaining slots are
+    filled with the most-starred repositories.
+    """
+    excluded_full_names, excluded_names = load_excluded()
+    pinned = {f"{repo['owner']}/{repo['name']}".lower() for repo in load_extra_repos()}
+
+    candidates = []
+    for repo_data in repos_dict.values():
+        full_name_lower = f"{repo_data['owner']}/{repo_data['name']}".lower()
+        if full_name_lower in excluded_full_names or repo_data["name"].lower() in excluded_names:
+            continue
+        candidates.append(repo_data)
+
+    candidates.sort(key=lambda x: x['stars'], reverse=True)
+    extras = [r for r in candidates if f"{r['owner']}/{r['name']}".lower() in pinned][:MAX_REPOS]
+    others = [r for r in candidates if f"{r['owner']}/{r['name']}".lower() not in pinned]
+    selected = extras + others[:MAX_REPOS - len(extras)]
+    selected.sort(key=lambda x: x['stars'], reverse=True)
+    return selected
+
 
 def read_existing_repos_from_csv():
     """Read existing repositories from CSV file."""
@@ -127,7 +158,7 @@ def fetch_extra_repo_details(extra_repos):
     detailed_repos = []
     for repo in extra_repos:
         url = f"https://api.github.com/repos/{repo['owner']}/{repo['name']}"
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             detailed_repos.append(response.json())
         else:
@@ -138,7 +169,7 @@ def refresh_existing_repos(existing_repos):
     """Refresh cached metadata and remove repositories that are archived."""
     for repo_id, repo_data in list(existing_repos.items()):
         url = f"https://api.github.com/repos/{repo_data['owner']}/{repo_data['name']}"
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             print(f"Failed to refresh details for {repo_data['owner']}/{repo_data['name']}")
             continue
@@ -155,6 +186,21 @@ def refresh_existing_repos(existing_repos):
             "stars": repository["stargazers_count"],
             "url": repository["html_url"]
         })
+
+def needs_business_model(stored, description):
+    """Return True when the stored text is missing or is only a fallback.
+
+    When the OpenAI call fails we store the plain repository description so the
+    row is not empty. Such rows must be retried on later runs, otherwise they
+    keep the fallback forever. Generated analyses always contain bold keywords.
+    """
+    stored = (stored or "").strip()
+    if not stored:
+        return True
+    if stored == (description or "").strip():
+        return True
+    return "**" not in stored
+
 
 def generate_business_model(repository):
     prompt = f"""
@@ -186,7 +232,7 @@ Note:
         ],
     }
     
-    response = requests.post(OPENAI_API_URL, headers=OPENAI_HEADERS, json=payload)
+    response = requests.post(OPENAI_API_URL, headers=OPENAI_HEADERS, json=payload, timeout=OPENAI_TIMEOUT)
     
     if response.status_code != 200:
         raise Exception(f"OpenAI API error: {response.status_code} - {response.text}")
@@ -211,26 +257,8 @@ def convert_csv_to_readme():
         print("No repositories found in CSV")
         return
     
-    # Load exclusion rules (owner/repo and name-only)
-    excluded_full_names, excluded_names = load_excluded()
-
-    # Convert to list and filter out excluded + sort by stars
-    repos_list = []
-    for repo_data in existing_repos.values():
-        owner = repo_data["owner"]
-        name = repo_data["name"]
-        full_name = f"{owner}/{name}"
-
-        full_name_lower = full_name.lower()
-        name_lower = name.lower()
-
-        if full_name_lower in excluded_full_names or name_lower in excluded_names:
-            continue
-
-        repos_list.append(repo_data)
-
-    repos_list.sort(key=lambda x: x['stars'], reverse=True)
-    repos_list = repos_list[:MAX_REPOS]
+    # Apply exclusions, keep pinned extras, and sort by stars
+    repos_list = select_repos(existing_repos)
 
     logos = {}
     with open(LOGO_CSV_FILE, 'r', newline='', encoding='utf-8') as file:
@@ -266,25 +294,8 @@ def save_repos_to_csv(repos_dict):
         print("No repositories to save to CSV")
         return
     
-    # Load exclusion rules (owner/repo and name-only)
-    excluded_full_names, excluded_names = load_excluded()
-
-    # Convert to list, apply exclusions, and sort by stars for CSV consistency
-    repos_list = []
-    for repo_data in repos_dict.values():
-        owner = repo_data["owner"]
-        name = repo_data["name"]
-        full_name = f"{owner}/{name}"
-
-        full_name_lower = full_name.lower()
-        name_lower = name.lower()
-
-        if full_name_lower in excluded_full_names or name_lower in excluded_names:
-            continue
-
-        repos_list.append(repo_data)
-    repos_list.sort(key=lambda x: x['stars'], reverse=True)
-    repos_list = repos_list[:MAX_REPOS]
+    # Apply exclusions, keep pinned extras, and sort by stars for CSV consistency
+    repos_list = select_repos(repos_dict)
     
     # Save to CSV file
     with open(CSV_FILE, 'w', newline='', encoding='utf-8') as file:
@@ -358,14 +369,17 @@ def main(max_repos=None):
         seen.add(repo["id"])
         unique_repos.append(repo)
 
-        # Check if this repo is new (not in existing CSV) and generate business model
-        if repo["id"] not in existing_repo_ids:
+        # Generate a business model for new repos, and retry repos that only
+        # have the fallback description from an earlier failed OpenAI call
+        existing = existing_repos.get(repo["id"])
+        stored = existing.get("business_model", "") if existing else ""
+        if existing is None or needs_business_model(stored, repo.get("description")):
             try:
                 business_model = generate_business_model(repo)
             except Exception as e:
                 # If the OpenAI call fails for any reason, fall back gracefully
                 print(f"Failed to generate business model for {full_name}: {e}")
-                business_model = repo.get("description") or ""
+                business_model = stored or repo.get("description") or ""
 
             # Add to existing repos with business model
             existing_repos[repo["id"]] = {
