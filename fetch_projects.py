@@ -2,6 +2,7 @@ import requests
 import os
 import json
 import csv
+import time
 from datetime import datetime, timedelta
 
 GITHUB_API = "https://api.github.com/search/repositories"
@@ -16,8 +17,11 @@ EXCLUDE_FILE = "excluded-repos.txt"  # File containing repos to exclude
 EXTRA_FILE = "extra-repos.txt"  # File containing repos that are always included
 CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
+AVATAR_URL = "https://github.com/{owner}.png?size=28"  # Used when a repo has no logo in logos.csv
 REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
 OPENAI_TIMEOUT = 120
+MAX_ATTEMPTS = 4  # Tries per GitHub request before giving up
+MAX_RETRY_WAIT = 60  # Upper bound in seconds for a single wait between tries
 
 # OpenAI API configuration
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -25,6 +29,48 @@ OPENAI_HEADERS = {
     "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
     "Content-Type": "application/json"
 }
+
+
+def retry_wait(response, attempt):
+    """Seconds to wait before the next try, honouring GitHub rate-limit headers."""
+    wait = 2 ** attempt
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        reset = response.headers.get("X-RateLimit-Reset")
+        try:
+            if retry_after:
+                wait = int(retry_after)
+            elif response.headers.get("X-RateLimit-Remaining") == "0" and reset:
+                wait = int(reset) - int(time.time()) + 1
+        except ValueError:
+            pass
+    return max(1, min(wait, MAX_RETRY_WAIT))
+
+
+def github_get(url, params=None):
+    """GET a GitHub API URL, retrying network errors, rate limits and 5xx responses.
+
+    Returns the last response (which may still be an error), or raises the last
+    network error if no response was ever received.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        response = None
+        try:
+            response = requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            print(f"Request error for {url}: {e}")
+        else:
+            if response.status_code not in (403, 429) and response.status_code < 500:
+                return response
+            if attempt == MAX_ATTEMPTS:
+                return response
+            print(f"GitHub returned {response.status_code} for {url}")
+
+        wait = retry_wait(response, attempt)
+        print(f"Retrying in {wait}s (attempt {attempt} of {MAX_ATTEMPTS})")
+        time.sleep(wait)
 
 
 def fetch_repositories(topic):
@@ -38,7 +84,13 @@ def fetch_repositories(topic):
             "per_page": PER_PAGE,
             "page": page
         }
-        response = requests.get(GITHUB_API, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+        response = github_get(GITHUB_API, params=params)
+        if response.status_code != 200:
+            # Stop the run: continuing would publish a list built from partial results
+            raise RuntimeError(
+                f"GitHub search failed for topic [{topic}] page [{page}]: "
+                f"{response.status_code} - {response.text[:200]}"
+            )
         repos_curr = response.json().get("items", [])
         if len(repos_curr) == 0:
             break
@@ -158,7 +210,7 @@ def fetch_extra_repo_details(extra_repos):
     detailed_repos = []
     for repo in extra_repos:
         url = f"https://api.github.com/repos/{repo['owner']}/{repo['name']}"
-        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response = github_get(url)
         if response.status_code == 200:
             detailed_repos.append(response.json())
         else:
@@ -166,10 +218,16 @@ def fetch_extra_repo_details(extra_repos):
     return detailed_repos
 
 def refresh_existing_repos(existing_repos):
-    """Refresh cached metadata and remove repositories that are archived."""
+    """Refresh cached metadata and remove repositories that are archived or gone."""
     for repo_id, repo_data in list(existing_repos.items()):
         url = f"https://api.github.com/repos/{repo_data['owner']}/{repo_data['name']}"
-        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response = github_get(url)
+        if response.status_code == 404:
+            # Deleted or made private: the README link would be dead
+            print(f"Removing {repo_data['owner']}/{repo_data['name']}: no longer available")
+            del existing_repos[repo_id]
+            continue
+
         if response.status_code != 200:
             print(f"Failed to refresh details for {repo_data['owner']}/{repo_data['name']}")
             continue
@@ -279,7 +337,10 @@ def convert_csv_to_readme():
             stars = format_stars(repo_data['stars'])
             business_model = repo_data.get('business_model', '')
             logo = logos.get((repo_data['owner'].lower(), repo_data['name'].lower()))
-            image = f'<img src="{logo}" width="14" height="14" /> ' if logo else ''
+            if not logo:
+                # No curated logo: fall back to the owner's GitHub avatar
+                logo = AVATAR_URL.format(owner=repo_data['owner'])
+            image = f'<img src="{logo}" width="14" height="14" /> '
             name = f"{image}**[{repo_data['name']}]({repo_data['url']})**"
             file.write(
                 f"| {index} | {escape_cell(name)} | "
@@ -319,8 +380,11 @@ def main(max_repos=None):
     if not os.getenv('GITHUB_TOKEN'):
         raise ValueError("GITHUB_TOKEN is not set")
     
-    if not os.getenv('OPENAI_API_KEY'):
-        raise ValueError("OPENAI_API_KEY is not set")
+    # Without an OpenAI key the list is still refreshed; new repos show their
+    # plain description until a later run with a key generates the analysis
+    openai_enabled = bool(os.getenv('OPENAI_API_KEY'))
+    if not openai_enabled:
+        print("OPENAI_API_KEY is not set: skipping business model generation")
 
     # 1. Read existing repos from CSV file
     print("Reading existing repositories from CSV...")
@@ -375,6 +439,8 @@ def main(max_repos=None):
         stored = existing.get("business_model", "") if existing else ""
         if existing is None or needs_business_model(stored, repo.get("description")):
             try:
+                if not openai_enabled:
+                    raise RuntimeError("OPENAI_API_KEY is not set")
                 business_model = generate_business_model(repo)
             except Exception as e:
                 # If the OpenAI call fails for any reason, fall back gracefully

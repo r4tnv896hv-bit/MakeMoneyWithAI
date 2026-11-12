@@ -2,11 +2,18 @@ name: Fetch AI Projects
 
 on:
   push:
+    branches: [main] # Feature branches would otherwise get data commits pushed onto them
+  workflow_dispatch: # Allows manual runs from the Actions tab
   schedule:
     - cron: "0 0 * * *" # Runs daily at midnight UTC
 
 permissions:
   contents: write
+
+# One run at a time, so two runs never race to push the generated files
+concurrency:
+  group: fetch-ai-projects-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   fetch-ai-projects:
@@ -17,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
