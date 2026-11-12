@@ -13,6 +13,7 @@ MIN_STARS = 10000
 MAX_REPOS = 100
 OUTPUT_FILE = "README.md"  # Output file name changed to README.md
 EXCLUDE_FILE = "excluded-repos.txt"  # File containing repos to exclude
+EXTRA_FILE = "extra-repos.txt"  # File containing repos that are always included
 CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
 REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
@@ -87,13 +88,41 @@ def load_excluded():
 def load_extra_repos():
     """Load additional repositories from extra-repos.txt."""
     extra_repos = []
-    with open("extra-repos.txt", "r") as file:
+    if not os.path.exists(EXTRA_FILE):
+        return extra_repos
+
+    with open(EXTRA_FILE, "r") as file:
         for line in file:
             owner_repo = line.strip()
             if owner_repo:
                 owner, repo = owner_repo.split("/")
                 extra_repos.append({"owner": owner, "name": repo})
     return extra_repos
+
+def select_repos(repos_dict):
+    """Apply exclusion rules and return at most MAX_REPOS repos sorted by stars.
+
+    Repositories listed in extra-repos.txt are always kept, even when their star
+    count would not place them in the top MAX_REPOS; the remaining slots are
+    filled with the most-starred repositories.
+    """
+    excluded_full_names, excluded_names = load_excluded()
+    pinned = {f"{repo['owner']}/{repo['name']}".lower() for repo in load_extra_repos()}
+
+    candidates = []
+    for repo_data in repos_dict.values():
+        full_name_lower = f"{repo_data['owner']}/{repo_data['name']}".lower()
+        if full_name_lower in excluded_full_names or repo_data["name"].lower() in excluded_names:
+            continue
+        candidates.append(repo_data)
+
+    candidates.sort(key=lambda x: x['stars'], reverse=True)
+    extras = [r for r in candidates if f"{r['owner']}/{r['name']}".lower() in pinned][:MAX_REPOS]
+    others = [r for r in candidates if f"{r['owner']}/{r['name']}".lower() not in pinned]
+    selected = extras + others[:MAX_REPOS - len(extras)]
+    selected.sort(key=lambda x: x['stars'], reverse=True)
+    return selected
+
 
 def read_existing_repos_from_csv():
     """Read existing repositories from CSV file."""
@@ -228,26 +257,8 @@ def convert_csv_to_readme():
         print("No repositories found in CSV")
         return
     
-    # Load exclusion rules (owner/repo and name-only)
-    excluded_full_names, excluded_names = load_excluded()
-
-    # Convert to list and filter out excluded + sort by stars
-    repos_list = []
-    for repo_data in existing_repos.values():
-        owner = repo_data["owner"]
-        name = repo_data["name"]
-        full_name = f"{owner}/{name}"
-
-        full_name_lower = full_name.lower()
-        name_lower = name.lower()
-
-        if full_name_lower in excluded_full_names or name_lower in excluded_names:
-            continue
-
-        repos_list.append(repo_data)
-
-    repos_list.sort(key=lambda x: x['stars'], reverse=True)
-    repos_list = repos_list[:MAX_REPOS]
+    # Apply exclusions, keep pinned extras, and sort by stars
+    repos_list = select_repos(existing_repos)
 
     logos = {}
     with open(LOGO_CSV_FILE, 'r', newline='', encoding='utf-8') as file:
@@ -283,25 +294,8 @@ def save_repos_to_csv(repos_dict):
         print("No repositories to save to CSV")
         return
     
-    # Load exclusion rules (owner/repo and name-only)
-    excluded_full_names, excluded_names = load_excluded()
-
-    # Convert to list, apply exclusions, and sort by stars for CSV consistency
-    repos_list = []
-    for repo_data in repos_dict.values():
-        owner = repo_data["owner"]
-        name = repo_data["name"]
-        full_name = f"{owner}/{name}"
-
-        full_name_lower = full_name.lower()
-        name_lower = name.lower()
-
-        if full_name_lower in excluded_full_names or name_lower in excluded_names:
-            continue
-
-        repos_list.append(repo_data)
-    repos_list.sort(key=lambda x: x['stars'], reverse=True)
-    repos_list = repos_list[:MAX_REPOS]
+    # Apply exclusions, keep pinned extras, and sort by stars for CSV consistency
+    repos_list = select_repos(repos_dict)
     
     # Save to CSV file
     with open(CSV_FILE, 'w', newline='', encoding='utf-8') as file:

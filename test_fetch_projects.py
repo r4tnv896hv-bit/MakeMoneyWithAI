@@ -41,6 +41,29 @@ class NeedsBusinessModelTest(unittest.TestCase):
         self.assertFalse(fp.needs_business_model("Sell **SaaS** agents.", "A tool."))
 
 
+class SelectReposTest(unittest.TestCase):
+    def test_extras_survive_the_star_cutoff(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = os.getcwd()
+        os.chdir(tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        with open(fp.EXTRA_FILE, "w") as f:
+            f.write("Acme/Small\n")
+        with open(fp.EXCLUDE_FILE, "w") as f:
+            f.write("blocked\n")
+
+        def row(repo_id, name, stars):
+            return {"id": repo_id, "owner": "acme", "name": name, "stars": stars,
+                    "url": "", "business_model": ""}
+
+        repos = {1: row(1, "big", 300), 2: row(2, "mid", 200), 3: row(3, "low", 100),
+                 4: row(4, "small", 5), 5: row(5, "blocked", 999)}
+        with mock.patch.object(fp, "MAX_REPOS", 3):
+            names = [r["name"] for r in fp.select_repos(repos)]
+        self.assertEqual(names, ["big", "mid", "small"])
+
+
 class RepoDataTest(unittest.TestCase):
     """Consistency checks on the committed data files."""
 
