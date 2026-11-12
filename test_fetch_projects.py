@@ -239,6 +239,14 @@ class MainTest(unittest.TestCase):
         self.assertEqual(len(result), 7)
         self.assertEqual(gen.call_count, fp.MAX_GENERATION_FAILURES)
 
+    def test_runs_without_a_key(self):
+        rows = [[1, "acme", "done", 30000, "https://github.com/acme/done", "Sell **hosting**."]]
+        search = [make_repo(1, "done", "Plain"), make_repo(3, "fresh", "Brand new")]
+        result, gen = self.run_main(rows, search, lambda repo: "unused", openai_key="")
+        self.assertEqual(result[1]["business_model"], "Sell **hosting**.")
+        self.assertEqual(result[3]["business_model"], "Brand new")
+        gen.assert_not_called()
+
 
 class ModelProviderTest(unittest.TestCase):
     REPO = make_repo(1, "tool", "A tool")
@@ -246,6 +254,7 @@ class ModelProviderTest(unittest.TestCase):
     def call(self, env, status=200):
         response = mock.Mock(status_code=status, text="body", headers={})
         response.json.return_value = {"choices": [{"message": {"content": " Sell **it**. "}}]}
+        env = {"OPENAI_API_URL": "", "OPENAI_MODEL": "", **env}
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(fp.time, "sleep") as sleep, \
                 mock.patch.object(fp.requests, "post", return_value=response) as post:
@@ -254,24 +263,39 @@ class ModelProviderTest(unittest.TestCase):
             except Exception as e:
                 return e, post, sleep
 
-    def test_openai_when_key_is_set(self):
-        text, post, sleep = self.call({"OPENAI_API_KEY": "sk-test", "GITHUB_TOKEN": "gh"})
+    def test_openai_key(self):
+        text, post, sleep = self.call({"OPENAI_API_KEY": "sk-test"})
         self.assertEqual(text, "Sell **it**.")
         self.assertEqual(post.call_args.args[0], fp.OPENAI_API_URL)
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer sk-test")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], fp.OPENAI_MODEL)
         sleep.assert_not_called()
 
-    def test_github_models_without_key(self):
-        text, post, sleep = self.call({"OPENAI_API_KEY": "", "GITHUB_TOKEN": "gh"})
+    def test_free_tier_key_is_detected_by_prefix(self):
+        text, post, sleep = self.call({"OPENAI_API_KEY": "AIzaTest"})
+        url, model = fp.KEY_PREFIX_PROVIDERS["AIza"]
         self.assertEqual(text, "Sell **it**.")
-        self.assertEqual(post.call_args.args[0], fp.GITHUB_MODELS_URL)
-        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer gh")
-        self.assertEqual(post.call_args.kwargs["json"]["model"], fp.GITHUB_MODELS_MODEL)
-        sleep.assert_called_once_with(fp.GITHUB_MODELS_DELAY)
+        self.assertEqual(post.call_args.args[0], url)
+        self.assertEqual(post.call_args.kwargs["json"]["model"], model)
+        sleep.assert_called_once_with(fp.GENERATION_DELAY)
+
+    def test_url_and_model_overrides(self):
+        env = {"OPENAI_API_KEY": "AIzaTest", "OPENAI_API_URL": "https://llm.example/v1", "OPENAI_MODEL": "m1"}
+        _, post, _ = self.call(env)
+        self.assertEqual(post.call_args.args[0], "https://llm.example/v1")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "m1")
 
     def test_429_raises_rate_limited(self):
-        error, _, _ = self.call({"OPENAI_API_KEY": "", "GITHUB_TOKEN": "gh"}, status=429)
+        error, _, _ = self.call({"OPENAI_API_KEY": "sk-test"}, status=429)
         self.assertIsInstance(error, fp.RateLimited)
+
+    def test_unexpected_body_is_reported(self):
+        response = mock.Mock(status_code=200, text="OK", headers={}, history=[], url="u")
+        response.json.side_effect = ValueError("no json")
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}), \
+                mock.patch.object(fp.requests, "post", return_value=response):
+            with self.assertRaisesRegex(Exception, "Unexpected response"):
+                fp.generate_business_model(self.REPO)
 
 
 class RefreshTest(unittest.TestCase):

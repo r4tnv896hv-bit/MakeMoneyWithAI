@@ -1,35 +1,54 @@
 name: Fetch AI Projects
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main] # Feature branches would otherwise get data commits pushed onto them
+  workflow_dispatch: # Allows manual runs from the Actions tab
+  schedule:
+    - cron: "0 0 * * *" # Runs daily at midnight UTC
 
 permissions:
-  contents: read
-  models: read
+  contents: write
+
+# One run at a time, so two runs never race to push the generated files
+concurrency:
+  group: fetch-ai-projects-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   fetch-ai-projects:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Diagnose GitHub Models
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch AI projects and update markdown
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # An OpenAI key, or a free-tier Google Gemini / Groq key (detected by its prefix)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Optional repository variables to use another model or OpenAI-compatible service
+          OPENAI_API_URL: ${{ vars.OPENAI_API_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+
+        run: python fetch_projects.py
+
+      # After the fetch, so hand edits to the exclude/extra lists are already applied
+      - name: Verify generated files
+        run: python -m unittest -q
+
+      - name: Commit and push changes
         run: |
-          set +e
-          call() { echo "=== $1"; shift; curl -sS -m 60 -o /tmp/out -w "status=%{http_code} type=%{content_type}\n" "$@"; head -c 600 /tmp/out; echo; }
-          BODY='{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Reply with the single word: pong"}]}'
-          call "A docs curl gpt-4o" -X POST https://models.github.ai/inference/chat/completions -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" -H "Content-Type: application/json" -d "$BODY"
-          call "B gpt-4.1-mini" -X POST https://models.github.ai/inference/chat/completions -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" -d '{"model":"openai/gpt-4.1-mini","messages":[{"role":"user","content":"Reply with the single word: pong"}]}'
-          call "C python UA" -X POST https://models.github.ai/inference/chat/completions -A "python-requests/2.32" -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" -d "$BODY"
-          call "D no auth" -X POST https://models.github.ai/inference/chat/completions -H "Content-Type: application/json" -d "$BODY"
-          call "E catalog" https://models.github.ai/catalog/models -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json"
-          call "F legacy azure" -X POST https://models.inference.ai.azure.com/chat/completions -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Reply with the single word: pong"}]}'
-          pip -q install requests
-          python - <<'PY'
-          import os, requests
-          r = requests.post("https://models.github.ai/inference/chat/completions",
-              headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Content-Type": "application/json"},
-              json={"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "Reply with the single word: pong"}]}, timeout=60)
-          print("=== G python requests", r.status_code, r.headers.get("Content-Type"), repr(r.text[:400]))
-          PY
-          exit 0
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md repos.csv
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update AI projects list" && git push)

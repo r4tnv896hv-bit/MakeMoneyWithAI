@@ -27,12 +27,14 @@ MAX_RETRY_WAIT = 60  # Upper bound in seconds for a single wait between tries
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-5-mini"
 
-# GitHub Models: free inference that works with the workflow's own GITHUB_TOKEN
-# (needs the "models: read" permission). Used when OPENAI_API_KEY is not set.
-GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
-GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL") or "openai/gpt-4.1-mini"
+# Other services with an OpenAI-compatible API, picked by the prefix of the key
+# stored in OPENAI_API_KEY. Both offer a free tier, so no paid account is needed.
+KEY_PREFIX_PROVIDERS = {
+    "AIza": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.5-flash"),
+    "gsk_": ("https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
+}
 MAX_GENERATION_FAILURES = 3  # Consecutive failures before generation is skipped for the run
-GITHUB_MODELS_DELAY = 5  # Seconds between calls; the free tier allows few requests per minute
+GENERATION_DELAY = 5  # Seconds between calls on free tiers, which allow few requests per minute
 
 
 class RateLimited(Exception):
@@ -40,11 +42,19 @@ class RateLimited(Exception):
 
 
 def model_provider():
-    """Return (url, api key, model, delay between calls) for the provider in use."""
-    openai_key = os.getenv('OPENAI_API_KEY')
-    if openai_key:
-        return OPENAI_API_URL, openai_key, OPENAI_MODEL, 0
-    return GITHUB_MODELS_URL, os.getenv('GITHUB_TOKEN'), GITHUB_MODELS_MODEL, GITHUB_MODELS_DELAY
+    """Return (url, api key, model, delay between calls) for the configured key.
+
+    OPENAI_API_URL and OPENAI_MODEL override the endpoint and model, so any
+    OpenAI-compatible service can be used.
+    """
+    api_key = (os.getenv('OPENAI_API_KEY') or '').strip()
+    url, model, delay = OPENAI_API_URL, OPENAI_MODEL, 0
+    for prefix, (provider_url, provider_model) in KEY_PREFIX_PROVIDERS.items():
+        if api_key.startswith(prefix):
+            url, model, delay = provider_url, provider_model, GENERATION_DELAY
+    url = (os.getenv('OPENAI_API_URL') or '').strip() or url
+    model = (os.getenv('OPENAI_MODEL') or '').strip() or model
+    return url, api_key, model, delay
 
 
 def retry_wait(response, attempt):
@@ -294,8 +304,6 @@ Note:
 
     url, api_key, model, delay = model_provider()
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    if url == GITHUB_MODELS_URL:
-        headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
     payload = {
         "model": model,
         "messages": [
@@ -413,8 +421,13 @@ def main(max_repos=None):
     if not os.getenv('GITHUB_TOKEN'):
         raise ValueError("GITHUB_TOKEN is not set")
     
-    print(f"Generating business models with {model_provider()[2]}")
-    generation_enabled = True
+    # Without a key the list is still refreshed; new repos show their plain
+    # description until a later run with a key generates the analysis
+    generation_enabled = bool(model_provider()[1])
+    if generation_enabled:
+        print(f"Generating business models with {model_provider()[2]}")
+    else:
+        print("OPENAI_API_KEY is not set: skipping business model generation")
     failures_in_a_row = 0
 
     # 1. Read existing repos from CSV file
