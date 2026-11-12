@@ -272,12 +272,13 @@ class ModelProviderTest(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_free_tier_key_is_detected_by_prefix(self):
-        text, post, sleep = self.call({"OPENAI_API_KEY": "AIzaTest"})
-        url, model = fp.KEY_PREFIX_PROVIDERS["AIza"]
-        self.assertEqual(text, "Sell **it**.")
-        self.assertEqual(post.call_args.args[0], url)
-        self.assertEqual(post.call_args.kwargs["json"]["model"], model)
-        sleep.assert_called_once_with(fp.GENERATION_DELAY)
+        url, model = fp.GEMINI
+        for key in ("AIzaTest", "AQ.Test"):
+            text, post, sleep = self.call({"OPENAI_API_KEY": key})
+            self.assertEqual(text, "Sell **it**.")
+            self.assertEqual(post.call_args.args[0], url)
+            self.assertEqual(post.call_args.kwargs["json"]["model"], model)
+            sleep.assert_called_once_with(fp.GENERATION_DELAY)
 
     def test_url_and_model_overrides(self):
         env = {"OPENAI_API_KEY": "AIzaTest", "OPENAI_API_URL": "https://llm.example/v1", "OPENAI_MODEL": "m1"}
