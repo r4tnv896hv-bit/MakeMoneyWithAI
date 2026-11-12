@@ -34,7 +34,11 @@ jobs:
       - name: Fetch AI projects and update markdown
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # An OpenAI key, or a free-tier Google Gemini / Groq key (detected by its prefix)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Optional repository variables to use another model or OpenAI-compatible service
+          OPENAI_API_URL: ${{ vars.OPENAI_API_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
 
         run: python fetch_projects.py
 
