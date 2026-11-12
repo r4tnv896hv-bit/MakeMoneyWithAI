@@ -290,6 +290,28 @@ class ModelProviderTest(unittest.TestCase):
         error, _, _ = self.call({"OPENAI_API_KEY": "sk-test"}, status=429)
         self.assertIsInstance(error, fp.RateLimited)
 
+    def test_busy_provider_is_retried(self):
+        busy = mock.Mock(status_code=503, text="busy", headers={})
+        ok = mock.Mock(status_code=200, text="body", headers={})
+        ok.json.return_value = {"choices": [{"message": {"content": "Sell **it**."}}]}
+        answers = [busy, fp.requests.Timeout("slow"), ok]
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test", "OPENAI_API_URL": "", "OPENAI_MODEL": ""}), \
+                mock.patch.object(fp.time, "sleep") as sleep, \
+                mock.patch.object(fp.requests, "post", side_effect=answers) as post:
+            self.assertEqual(fp.generate_business_model(self.REPO), "Sell **it**.")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],
+                         [fp.MODEL_RETRY_WAIT, fp.MODEL_RETRY_WAIT * 2])
+
+    def test_busy_provider_gives_up(self):
+        busy = mock.Mock(status_code=503, text="busy", headers={})
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test", "OPENAI_API_URL": "", "OPENAI_MODEL": ""}), \
+                mock.patch.object(fp.time, "sleep"), \
+                mock.patch.object(fp.requests, "post", return_value=busy) as post:
+            with self.assertRaisesRegex(Exception, "503"):
+                fp.generate_business_model(self.REPO)
+        self.assertEqual(post.call_count, fp.MODEL_ATTEMPTS)
+
     def test_unexpected_body_is_reported(self):
         response = mock.Mock(status_code=200, text="OK", headers={}, history=[], url="u")
         response.json.side_effect = ValueError("no json")
