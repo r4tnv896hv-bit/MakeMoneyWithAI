@@ -234,7 +234,7 @@ class ModelProviderTest(unittest.TestCase):
     REPO = make_repo(1, "tool", "A tool")
 
     def call(self, env, status=200):
-        response = mock.Mock(status_code=status, text="body")
+        response = mock.Mock(status_code=status, text="body", headers={})
         response.json.return_value = {"choices": [{"message": {"content": " Sell **it**. "}}]}
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(fp.time, "sleep") as sleep, \

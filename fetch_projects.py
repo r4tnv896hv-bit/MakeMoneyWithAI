@@ -293,6 +293,8 @@ Note:
 
     url, api_key, model, delay = model_provider()
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if url == GITHUB_MODELS_URL:
+        headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
     payload = {
         "model": model,
         "messages": [
@@ -316,9 +318,16 @@ Note:
     if response.status_code != 200:
         raise Exception(f"Model API error ({model}): {response.status_code} - {response.text[:300]}")
     
-    result = response.json()
-    business_model = result['choices'][0]['message']['content'].strip()
-    
+    try:
+        business_model = response.json()['choices'][0]['message']['content'].strip()
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        raise Exception(
+            f"Unexpected response from {model} "
+            f"({response.headers.get('Content-Type')}): {response.text[:300]!r}"
+        )
+    if not business_model:
+        raise Exception(f"Empty answer from {model}")
+
     print(f"Generated business model for {repository['name']}")
     return business_model
 
