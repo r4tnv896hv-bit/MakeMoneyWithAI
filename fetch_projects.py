@@ -17,6 +17,7 @@ EXCLUDE_FILE = "excluded-repos.txt"  # File containing repos to exclude
 EXTRA_FILE = "extra-repos.txt"  # File containing repos that are always included
 CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
+AVATAR_URL = "https://github.com/{owner}.png?size=28"  # Used when a repo has no logo in logos.csv
 REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
 OPENAI_TIMEOUT = 120
 MAX_ATTEMPTS = 4  # Tries per GitHub request before giving up
@@ -217,10 +218,16 @@ def fetch_extra_repo_details(extra_repos):
     return detailed_repos
 
 def refresh_existing_repos(existing_repos):
-    """Refresh cached metadata and remove repositories that are archived."""
+    """Refresh cached metadata and remove repositories that are archived or gone."""
     for repo_id, repo_data in list(existing_repos.items()):
         url = f"https://api.github.com/repos/{repo_data['owner']}/{repo_data['name']}"
         response = github_get(url)
+        if response.status_code == 404:
+            # Deleted or made private: the README link would be dead
+            print(f"Removing {repo_data['owner']}/{repo_data['name']}: no longer available")
+            del existing_repos[repo_id]
+            continue
+
         if response.status_code != 200:
             print(f"Failed to refresh details for {repo_data['owner']}/{repo_data['name']}")
             continue
@@ -330,7 +337,10 @@ def convert_csv_to_readme():
             stars = format_stars(repo_data['stars'])
             business_model = repo_data.get('business_model', '')
             logo = logos.get((repo_data['owner'].lower(), repo_data['name'].lower()))
-            image = f'<img src="{logo}" width="14" height="14" /> ' if logo else ''
+            if not logo:
+                # No curated logo: fall back to the owner's GitHub avatar
+                logo = AVATAR_URL.format(owner=repo_data['owner'])
+            image = f'<img src="{logo}" width="14" height="14" /> '
             name = f"{image}**[{repo_data['name']}]({repo_data['url']})**"
             file.write(
                 f"| {index} | {escape_cell(name)} | "
@@ -370,8 +380,11 @@ def main(max_repos=None):
     if not os.getenv('GITHUB_TOKEN'):
         raise ValueError("GITHUB_TOKEN is not set")
     
-    if not os.getenv('OPENAI_API_KEY'):
-        raise ValueError("OPENAI_API_KEY is not set")
+    # Without an OpenAI key the list is still refreshed; new repos show their
+    # plain description until a later run with a key generates the analysis
+    openai_enabled = bool(os.getenv('OPENAI_API_KEY'))
+    if not openai_enabled:
+        print("OPENAI_API_KEY is not set: skipping business model generation")
 
     # 1. Read existing repos from CSV file
     print("Reading existing repositories from CSV...")
@@ -426,6 +439,8 @@ def main(max_repos=None):
         stored = existing.get("business_model", "") if existing else ""
         if existing is None or needs_business_model(stored, repo.get("description")):
             try:
+                if not openai_enabled:
+                    raise RuntimeError("OPENAI_API_KEY is not set")
                 business_model = generate_business_model(repo)
             except Exception as e:
                 # If the OpenAI call fails for any reason, fall back gracefully
