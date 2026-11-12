@@ -15,6 +15,8 @@ OUTPUT_FILE = "README.md"  # Output file name changed to README.md
 EXCLUDE_FILE = "excluded-repos.txt"  # File containing repos to exclude
 CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
+REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
+OPENAI_TIMEOUT = 120
 
 # OpenAI API configuration
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -35,7 +37,7 @@ def fetch_repositories(topic):
             "per_page": PER_PAGE,
             "page": page
         }
-        response = requests.get(GITHUB_API, headers=HEADERS, params=params)
+        response = requests.get(GITHUB_API, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
         repos_curr = response.json().get("items", [])
         if len(repos_curr) == 0:
             break
@@ -127,7 +129,7 @@ def fetch_extra_repo_details(extra_repos):
     detailed_repos = []
     for repo in extra_repos:
         url = f"https://api.github.com/repos/{repo['owner']}/{repo['name']}"
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             detailed_repos.append(response.json())
         else:
@@ -138,7 +140,7 @@ def refresh_existing_repos(existing_repos):
     """Refresh cached metadata and remove repositories that are archived."""
     for repo_id, repo_data in list(existing_repos.items()):
         url = f"https://api.github.com/repos/{repo_data['owner']}/{repo_data['name']}"
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             print(f"Failed to refresh details for {repo_data['owner']}/{repo_data['name']}")
             continue
@@ -155,6 +157,21 @@ def refresh_existing_repos(existing_repos):
             "stars": repository["stargazers_count"],
             "url": repository["html_url"]
         })
+
+def needs_business_model(stored, description):
+    """Return True when the stored text is missing or is only a fallback.
+
+    When the OpenAI call fails we store the plain repository description so the
+    row is not empty. Such rows must be retried on later runs, otherwise they
+    keep the fallback forever. Generated analyses always contain bold keywords.
+    """
+    stored = (stored or "").strip()
+    if not stored:
+        return True
+    if stored == (description or "").strip():
+        return True
+    return "**" not in stored
+
 
 def generate_business_model(repository):
     prompt = f"""
@@ -186,7 +203,7 @@ Note:
         ],
     }
     
-    response = requests.post(OPENAI_API_URL, headers=OPENAI_HEADERS, json=payload)
+    response = requests.post(OPENAI_API_URL, headers=OPENAI_HEADERS, json=payload, timeout=OPENAI_TIMEOUT)
     
     if response.status_code != 200:
         raise Exception(f"OpenAI API error: {response.status_code} - {response.text}")
@@ -358,14 +375,17 @@ def main(max_repos=None):
         seen.add(repo["id"])
         unique_repos.append(repo)
 
-        # Check if this repo is new (not in existing CSV) and generate business model
-        if repo["id"] not in existing_repo_ids:
+        # Generate a business model for new repos, and retry repos that only
+        # have the fallback description from an earlier failed OpenAI call
+        existing = existing_repos.get(repo["id"])
+        stored = existing.get("business_model", "") if existing else ""
+        if existing is None or needs_business_model(stored, repo.get("description")):
             try:
                 business_model = generate_business_model(repo)
             except Exception as e:
                 # If the OpenAI call fails for any reason, fall back gracefully
                 print(f"Failed to generate business model for {full_name}: {e}")
-                business_model = repo.get("description") or ""
+                business_model = stored or repo.get("description") or ""
 
             # Add to existing repos with business model
             existing_repos[repo["id"]] = {
