@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  models: read # Free GitHub Models inference, used when OPENAI_API_KEY is not set
 
 # One run at a time, so two runs never race to push the generated files
 concurrency:

@@ -216,13 +216,52 @@ class MainTest(unittest.TestCase):
         self.assertEqual(sorted(result), [1, 2])
         self.assertEqual(gen.call_count, 2)
 
-    def test_runs_without_openai_key(self):
-        rows = [[1, "acme", "done", 30000, "https://github.com/acme/done", "Sell **hosting**."]]
-        search = [make_repo(1, "done", "Plain"), make_repo(3, "fresh", "Brand new")]
-        result, gen = self.run_main(rows, search, lambda repo: "unused", openai_key="")
-        self.assertEqual(result[1]["business_model"], "Sell **hosting**.")
-        self.assertEqual(result[3]["business_model"], "Brand new")
-        gen.assert_not_called()
+    def test_rate_limit_stops_generation_for_the_run(self):
+        search = [make_repo(i, f"repo{i}", f"Plain {i}", stars=1000 - i) for i in range(1, 5)]
+
+        def generate(repo):
+            if repo["id"] >= 2:
+                raise fp.RateLimited("quota")
+            return "**first** income"
+
+        result, gen = self.run_main([], search, generate)
+        self.assertEqual(result[1]["business_model"], "**first** income")
+        self.assertEqual(result[3]["business_model"], "Plain 3")
+        self.assertEqual(gen.call_count, 2)  # stopped after the first refusal
+
+
+class ModelProviderTest(unittest.TestCase):
+    REPO = make_repo(1, "tool", "A tool")
+
+    def call(self, env, status=200):
+        response = mock.Mock(status_code=status, text="body")
+        response.json.return_value = {"choices": [{"message": {"content": " Sell **it**. "}}]}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(fp.time, "sleep") as sleep, \
+                mock.patch.object(fp.requests, "post", return_value=response) as post:
+            try:
+                return fp.generate_business_model(self.REPO), post, sleep
+            except Exception as e:
+                return e, post, sleep
+
+    def test_openai_when_key_is_set(self):
+        text, post, sleep = self.call({"OPENAI_API_KEY": "sk-test", "GITHUB_TOKEN": "gh"})
+        self.assertEqual(text, "Sell **it**.")
+        self.assertEqual(post.call_args.args[0], fp.OPENAI_API_URL)
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer sk-test")
+        sleep.assert_not_called()
+
+    def test_github_models_without_key(self):
+        text, post, sleep = self.call({"OPENAI_API_KEY": "", "GITHUB_TOKEN": "gh"})
+        self.assertEqual(text, "Sell **it**.")
+        self.assertEqual(post.call_args.args[0], fp.GITHUB_MODELS_URL)
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer gh")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], fp.GITHUB_MODELS_MODEL)
+        sleep.assert_called_once_with(fp.GITHUB_MODELS_DELAY)
+
+    def test_429_raises_rate_limited(self):
+        error, _, _ = self.call({"OPENAI_API_KEY": "", "GITHUB_TOKEN": "gh"}, status=429)
+        self.assertIsInstance(error, fp.RateLimited)
 
 
 class RefreshTest(unittest.TestCase):

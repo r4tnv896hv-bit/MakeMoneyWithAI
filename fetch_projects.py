@@ -25,10 +25,25 @@ MAX_RETRY_WAIT = 60  # Upper bound in seconds for a single wait between tries
 
 # OpenAI API configuration
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_HEADERS = {
-    "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-    "Content-Type": "application/json"
-}
+OPENAI_MODEL = "gpt-5-mini"
+
+# GitHub Models: free inference that works with the workflow's own GITHUB_TOKEN
+# (needs the "models: read" permission). Used when OPENAI_API_KEY is not set.
+GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
+GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL") or "openai/gpt-4.1-mini"
+GITHUB_MODELS_DELAY = 5  # Seconds between calls; the free tier allows few requests per minute
+
+
+class RateLimited(Exception):
+    """The model provider refused the call because its quota is used up."""
+
+
+def model_provider():
+    """Return (url, api key, model, delay between calls) for the provider in use."""
+    openai_key = os.getenv('OPENAI_API_KEY')
+    if openai_key:
+        return OPENAI_API_URL, openai_key, OPENAI_MODEL, 0
+    return GITHUB_MODELS_URL, os.getenv('GITHUB_TOKEN'), GITHUB_MODELS_MODEL, GITHUB_MODELS_DELAY
 
 
 def retry_wait(response, attempt):
@@ -276,8 +291,10 @@ Note:
 - Do not include the repository name and URL in the business analysis.
 """
 
+    url, api_key, model, delay = model_provider()
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": "gpt-5-mini",
+        "model": model,
         "messages": [
             {
                 "role": "system",
@@ -290,10 +307,14 @@ Note:
         ],
     }
     
-    response = requests.post(OPENAI_API_URL, headers=OPENAI_HEADERS, json=payload, timeout=OPENAI_TIMEOUT)
-    
+    if delay:
+        time.sleep(delay)
+    response = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+
+    if response.status_code == 429:
+        raise RateLimited(f"{model} rate limit reached: {response.text[:200]}")
     if response.status_code != 200:
-        raise Exception(f"OpenAI API error: {response.status_code} - {response.text}")
+        raise Exception(f"Model API error ({model}): {response.status_code} - {response.text[:300]}")
     
     result = response.json()
     business_model = result['choices'][0]['message']['content'].strip()
@@ -380,11 +401,8 @@ def main(max_repos=None):
     if not os.getenv('GITHUB_TOKEN'):
         raise ValueError("GITHUB_TOKEN is not set")
     
-    # Without an OpenAI key the list is still refreshed; new repos show their
-    # plain description until a later run with a key generates the analysis
-    openai_enabled = bool(os.getenv('OPENAI_API_KEY'))
-    if not openai_enabled:
-        print("OPENAI_API_KEY is not set: skipping business model generation")
+    print(f"Generating business models with {model_provider()[2]}")
+    generation_enabled = True
 
     # 1. Read existing repos from CSV file
     print("Reading existing repositories from CSV...")
@@ -457,14 +475,18 @@ def main(max_repos=None):
         # earlier failed OpenAI call
         stored = repo_data.get('business_model', '')
         if needs_business_model(stored, repo.get("description")):
-            try:
-                if not openai_enabled:
-                    raise RuntimeError("OPENAI_API_KEY is not set")
-                business_model = generate_business_model(repo)
-            except Exception as e:
-                # If the OpenAI call fails for any reason, fall back gracefully
-                print(f"Failed to generate business model for {repo_data['owner']}/{repo_data['name']}: {e}")
-                business_model = stored or repo.get("description") or ""
+            full_name = f"{repo_data['owner']}/{repo_data['name']}"
+            business_model = stored or repo.get("description") or ""
+            if generation_enabled:
+                try:
+                    business_model = generate_business_model(repo)
+                except RateLimited as e:
+                    # Quota used up: the remaining repos are retried on the next run
+                    print(f"Stopping generation for this run at {full_name}: {e}")
+                    generation_enabled = False
+                except Exception as e:
+                    # If the call fails for any other reason, fall back gracefully
+                    print(f"Failed to generate business model for {full_name}: {e}")
             repo_data['business_model'] = business_model
 
     print(f"Total unique repos: {len(unique_repos)}")
