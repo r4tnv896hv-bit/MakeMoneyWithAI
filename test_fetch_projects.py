@@ -41,6 +41,52 @@ class NeedsBusinessModelTest(unittest.TestCase):
         self.assertFalse(fp.needs_business_model("Sell **SaaS** agents.", "A tool."))
 
 
+class FakeResponse:
+    def __init__(self, status_code=200, items=None, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = "error body"
+        self._items = items or []
+
+    def json(self):
+        return {"items": self._items}
+
+
+class GithubRequestTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(fp.time, "sleep")
+        self.sleep = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_retries_then_succeeds(self):
+        responses = [fp.requests.ConnectionError("down"), FakeResponse(502),
+                     FakeResponse(403, headers={"Retry-After": "7"}), FakeResponse(200)]
+        with mock.patch.object(fp.requests, "get", side_effect=responses) as get:
+            self.assertEqual(fp.github_get("https://x").status_code, 200)
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 4, 7])
+
+    def test_not_found_is_not_retried(self):
+        with mock.patch.object(fp.requests, "get", return_value=FakeResponse(404)) as get:
+            self.assertEqual(fp.github_get("https://x").status_code, 404)
+        self.assertEqual(get.call_count, 1)
+
+    def test_wait_is_capped(self):
+        response = FakeResponse(429, headers={"Retry-After": "3600"})
+        self.assertEqual(fp.retry_wait(response, 1), fp.MAX_RETRY_WAIT)
+
+    def test_search_failure_stops_the_run(self):
+        with mock.patch.object(fp.requests, "get", return_value=FakeResponse(403)) as get:
+            with self.assertRaises(RuntimeError):
+                fp.fetch_repositories("ai")
+        self.assertEqual(get.call_count, fp.MAX_ATTEMPTS)
+
+    def test_search_pages_until_empty(self):
+        pages = [FakeResponse(items=[{"id": 1}]), FakeResponse(items=[{"id": 2}]), FakeResponse()]
+        with mock.patch.object(fp.requests, "get", side_effect=pages):
+            self.assertEqual(fp.fetch_repositories("ai"), [{"id": 1}, {"id": 2}])
+
+
 class SelectReposTest(unittest.TestCase):
     def test_extras_survive_the_star_cutoff(self):
         tmp = tempfile.TemporaryDirectory()

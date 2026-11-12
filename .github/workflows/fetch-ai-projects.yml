@@ -2,6 +2,7 @@ name: Fetch AI Projects
 
 on:
   push:
+  workflow_dispatch: # Allows manual runs from the Actions tab
   schedule:
     - cron: "0 0 * * *" # Runs daily at midnight UTC
 
