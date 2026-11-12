@@ -19,7 +19,9 @@ CSV_FILE = "repos.csv"  # CSV file to store repository data
 LOGO_CSV_FILE = "logos.csv"
 AVATAR_URL = "https://github.com/{owner}.png?size=28"  # Used when a repo has no logo in logos.csv
 REQUEST_TIMEOUT = 30  # Seconds; avoids a hung request stalling the whole run
-OPENAI_TIMEOUT = 120
+OPENAI_TIMEOUT = 60
+MODEL_ATTEMPTS = 4  # Tries per model call when the provider is busy
+MODEL_RETRY_WAIT = 15  # Seconds, multiplied by the attempt number
 MAX_ATTEMPTS = 4  # Tries per GitHub request before giving up
 MAX_RETRY_WAIT = 60  # Upper bound in seconds for a single wait between tries
 
@@ -322,7 +324,24 @@ Note:
     
     if delay:
         time.sleep(delay)
-    response = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+    # Providers answer 5xx or time out when they are busy; that usually clears quickly
+    for attempt in range(1, MODEL_ATTEMPTS + 1):
+        response = None
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+        except requests.RequestException as e:
+            if attempt == MODEL_ATTEMPTS:
+                raise
+            print(f"{model} request error: {e}")
+        if response is not None and response.status_code < 500:
+            break
+        if attempt == MODEL_ATTEMPTS:
+            break
+        if response is not None:
+            print(f"{model} returned {response.status_code}")
+        wait = MODEL_RETRY_WAIT * attempt
+        print(f"Retrying in {wait}s (attempt {attempt} of {MODEL_ATTEMPTS})")
+        time.sleep(wait)
 
     if response.status_code == 429:
         raise RateLimited(f"{model} rate limit reached: {response.text[:200]}")
