@@ -403,7 +403,7 @@ def main(max_repos=None):
     for topic in TOPICS:
         all_repos.extend(fetch_repositories(topic))
     
-    # 3. Process all repos and generate business models for new ones
+    # 3. Deduplicate and filter the fetched repos
     seen = set()
     unique_repos = []
     
@@ -433,30 +433,40 @@ def main(max_repos=None):
         seen.add(repo["id"])
         unique_repos.append(repo)
 
-        # Generate a business model for new repos, and retry repos that only
-        # have the fallback description from an earlier failed OpenAI call
-        existing = existing_repos.get(repo["id"])
-        stored = existing.get("business_model", "") if existing else ""
-        if existing is None or needs_business_model(stored, repo.get("description")):
-            try:
-                if not openai_enabled:
-                    raise RuntimeError("OPENAI_API_KEY is not set")
-                business_model = generate_business_model(repo)
-            except Exception as e:
-                # If the OpenAI call fails for any reason, fall back gracefully
-                print(f"Failed to generate business model for {full_name}: {e}")
-                business_model = stored or repo.get("description") or ""
-
-            # Add to existing repos with business model
+        # Register repos that are not in the CSV yet; the text is filled in below
+        if repo["id"] not in existing_repos:
             existing_repos[repo["id"]] = {
                 'id': repo["id"],
                 'owner': owner_login,
                 'name': name,
                 'stars': repo['stargazers_count'],
                 'url': repo['html_url'],
-                'business_model': business_model
+                'business_model': ''
             }
-    
+
+    # Generate business models only for repos that make the final list. Several
+    # hundred repos match the search, and calling OpenAI for the ones that are
+    # cut by MAX_REPOS would repeat the same wasted calls on every run.
+    fetched = {repo["id"]: repo for repo in unique_repos}
+    for repo_data in select_repos(existing_repos):
+        repo = fetched.get(repo_data['id'])
+        if repo is None:
+            continue
+
+        # New repos, and repos that only have the fallback description from an
+        # earlier failed OpenAI call
+        stored = repo_data.get('business_model', '')
+        if needs_business_model(stored, repo.get("description")):
+            try:
+                if not openai_enabled:
+                    raise RuntimeError("OPENAI_API_KEY is not set")
+                business_model = generate_business_model(repo)
+            except Exception as e:
+                # If the OpenAI call fails for any reason, fall back gracefully
+                print(f"Failed to generate business model for {repo_data['owner']}/{repo_data['name']}: {e}")
+                business_model = stored or repo.get("description") or ""
+            repo_data['business_model'] = business_model
+
     print(f"Total unique repos: {len(unique_repos)}")
     
     # 4. Save all repositories (existing + new) to CSV

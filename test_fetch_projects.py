@@ -209,6 +209,13 @@ class MainTest(unittest.TestCase):
         self.assertEqual(result[3]["business_model"], "Brand new")
 
 
+    def test_only_listed_repos_are_generated(self):
+        search = [make_repo(i, f"repo{i}", "Plain", stars=1000 - i) for i in range(1, 6)]
+        with mock.patch.object(fp, "MAX_REPOS", 2):
+            result, gen = self.run_main([], search, lambda repo: f"**{repo['name']}** income")
+        self.assertEqual(sorted(result), [1, 2])
+        self.assertEqual(gen.call_count, 2)
+
     def test_runs_without_openai_key(self):
         rows = [[1, "acme", "done", 30000, "https://github.com/acme/done", "Sell **hosting**."]]
         search = [make_repo(1, "done", "Plain"), make_repo(3, "fresh", "Brand new")]
