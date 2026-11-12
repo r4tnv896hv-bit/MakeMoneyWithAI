@@ -29,7 +29,7 @@ OPENAI_MODEL = "gpt-5-mini"
 
 # Other services with an OpenAI-compatible API, picked by the prefix of the key
 # stored in OPENAI_API_KEY. Both offer a free tier, so no paid account is needed.
-GEMINI = ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.5-flash")
+GEMINI = ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.8-flash")
 KEY_PREFIX_PROVIDERS = {
     "AIza": GEMINI,  # Older Google AI Studio keys
     "AQ.": GEMINI,  # Current Google AI Studio keys
